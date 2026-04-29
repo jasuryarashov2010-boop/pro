@@ -1,810 +1,463 @@
+#!/usr/bin/env python3
+# app_combined.py
 """
-=============================================================================
-MATH EDU-TECH PLATFORM - ENTERPRISE TELEGRAM BOT
-Version: 3.0.0 (FAANG Level Architecture)
-Author: AI (Gemini)
-Features: Async ORM, Pydantic Config, Rate Limiting Middleware, FSM, 
-          AI Retry Logic, Gamification Engine, Render Webhook/Healthcheck
-=============================================================================
+Combined single-file implementation of math_tekshiruvchi_bot (minimal, runnable).
+Features:
+- Env-based config (via python-dotenv / os.environ)
+- FastAPI health endpoints (Render-ready)
+- aiogram bot with polling fallback
+- Async SQLAlchemy (SQLite default) with minimal models: users, tests, attempts, messages
+- Basic handlers: /start, main menu, tests list, AI (/ai), admin /broadcast (admin only)
+- Certificate PDF generator (WeasyPrint optional; falls back to text file)
+- Graceful error handling, logging, and safe env usage
+Note: Extend modules by splitting into packages for production.
 """
-
 import os
 import sys
-import uuid
-import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any, Tuple
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-# Web & Networking
-from aiohttp import web
+# Load env from .env if present
+from dotenv import load_dotenv
+load_dotenv()
 
-# AIogram - Telegram Bot Framework
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode, ChatAction
-from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton,
-    Update, BotCommand, ErrorEvent
-)
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.filters.callback_data import CallbackData
-from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
-from aiogram.exceptions import TelegramAPIError
-from aiogram import BaseMiddleware
+# ====== CONFIG ======
+from pydantic import BaseSettings, Field
 
-# Pydantic - Configuration Management
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, SecretStr
-
-# SQLAlchemy - Asynchronous ORM
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, Mapped, mapped_column, relationship
-from sqlalchemy import Integer, String, Boolean, DateTime, Float, ForeignKey, Text, select, update, func, desc
-
-# Tenacity - Fault tolerance & Retries for AI API
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-# APScheduler - Background tasks
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
-# =============================================================================
-# 1. CONFIGURATION (PYDANTIC) - XAVFSIZ VA TARTIBLI
-# =============================================================================
 class Settings(BaseSettings):
-    bot_token: SecretStr
-    admin_id: int
-    gemini_api_key: SecretStr = SecretStr("")
-    openai_api_key: SecretStr = SecretStr("")
-    db_url: str = "sqlite+aiosqlite:///enterprise_edu.db"
-    port: int = 10000
-    app_env: str = "production"
-    webhook_url: Optional[str] = None
-    use_webhook: bool = False
-    rate_limit_seconds: float = 0.5
-    
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    BOT_TOKEN: str = Field(..., env="BOT_TOKEN")
+    ADMIN_ID: int = Field(..., env="ADMIN_ID")
+    DATABASE_URL: str = Field("sqlite+aiosqlite:///./data.db", env="DATABASE_URL")
+    WEBHOOK_MODE: bool = Field(False, env="WEBHOOK_MODE")
+    WEBHOOK_URL: Optional[str] = Field(None, env="WEBHOOK_URL")
+    WEBHOOK_PATH: str = Field("/webhook", env="WEBHOOK_PATH")
+    PORT: int = Field(8000, env="PORT")
+    LOG_LEVEL: str = Field("INFO", env="LOG_LEVEL")
+    RATE_LIMIT_PER_MINUTE: int = Field(30, env="RATE_LIMIT_PER_MINUTE")
 
-try:
-    config = Settings()
-except Exception as e:
-    print(f"❌ KRACH: Environment variables topilmadi yoki xato. Sababi: {e}")
-    sys.exit(1)
+settings = Settings()
 
-# =============================================================================
-# 2. LOGGING (PROFESSIONAL FORMATTER)
-# =============================================================================
-class CustomFormatter(logging.Formatter):
-    grey = "\x1b[38;20m"
-    yellow = "\x1b[33;20m"
-    red = "\x1b[31;20m"
-    bold_red = "\x1b[31;1m"
-    reset = "\x1b[0m"
-    format_str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s (%(filename)s:%(lineno)d)"
+# ====== LOGGING ======
+LOG_LEVEL = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("math_tekshiruvchi_bot")
 
-    FORMATS = {
-        logging.DEBUG: grey + format_str + reset,
-        logging.INFO: grey + format_str + reset,
-        logging.WARNING: yellow + format_str + reset,
-        logging.ERROR: red + format_str + reset,
-        logging.CRITICAL: bold_red + format_str + reset
-    }
+# ====== ASYNC DB SETUP (SQLAlchemy) ======
+import sqlalchemy as sa
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
 
-    def format(self, record):
-        log_fmt = self.FORMATS.get(record.levelno)
-        formatter = logging.Formatter(log_fmt)
-        return formatter.format(record)
-
-logger = logging.getLogger("EduBot")
-logger.setLevel(logging.DEBUG if config.app_env == "development" else logging.INFO)
-ch = logging.StreamHandler()
-ch.setFormatter(CustomFormatter())
-logger.addHandler(ch)
-
-# =============================================================================
-# 3. DATABASE (SQLALCHEMY ASYNC ORM) - DUNYOVIY STANDART
-# =============================================================================
+DATABASE_URL = settings.DATABASE_URL
+engine = create_async_engine(DATABASE_URL, future=True, echo=False)
+AsyncSessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
 
+# Models
 class User(Base):
-    __tablename__ = 'users'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True) # Telegram User ID
-    username: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    full_name: Mapped[str] = mapped_column(String)
-    xp: Mapped[int] = mapped_column(Integer, default=0)
-    level: Mapped[int] = mapped_column(Integer, default=1)
-    streak: Mapped[int] = mapped_column(Integer, default=0)
-    last_active: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    joined_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    is_banned: Mapped[bool] = mapped_column(Boolean, default=False)
-    
-    results = relationship("Result", back_populates="user", cascade="all, delete-orphan")
+    __tablename__ = "users"
+    id = sa.Column(sa.Integer, primary_key=True, index=True)
+    tg_id = sa.Column(sa.Integer, unique=True, index=True, nullable=False)
+    username = sa.Column(sa.String(64))
+    first_name = sa.Column(sa.String(128))
+    last_name = sa.Column(sa.String(128))
+    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
+    xp = sa.Column(sa.Integer, default=0)
+    level = sa.Column(sa.Integer, default=1)
+    streak = sa.Column(sa.Integer, default=0)
+    badges = sa.Column(sa.JSON, default=[])
+    settings = sa.Column(sa.JSON, default={})
 
 class Test(Base):
-    __tablename__ = 'tests'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    test_code: Mapped[str] = mapped_column(String, unique=True, index=True)
-    title: Mapped[str] = mapped_column(String)
-    category: Mapped[str] = mapped_column(String, index=True)
-    difficulty: Mapped[str] = mapped_column(String) # Easy, Medium, Hard, Expert
-    correct_answers: Mapped[str] = mapped_column(String)
-    pdf_file_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    __tablename__ = "tests"
+    id = sa.Column(sa.Integer, primary_key=True, index=True)
+    code = sa.Column(sa.String(64), unique=True, index=True, nullable=False)
+    title = sa.Column(sa.String(255), nullable=False)
+    description = sa.Column(sa.Text)
+    pdf_url = sa.Column(sa.String(1024))
+    category = sa.Column(sa.String(128), index=True)
+    topic = sa.Column(sa.String(128), index=True)
+    difficulty = sa.Column(sa.String(32), index=True)
+    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
+    meta = sa.Column(sa.JSON, default={})
 
-    results = relationship("Result", back_populates="test", cascade="all, delete-orphan")
+class Attempt(Base):
+    __tablename__ = "attempts"
+    id = sa.Column(sa.Integer, primary_key=True, index=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    test_id = sa.Column(sa.Integer, sa.ForeignKey("tests.id", ondelete="CASCADE"), nullable=False, index=True)
+    started_at = sa.Column(sa.DateTime, default=datetime.utcnow)
+    finished_at = sa.Column(sa.DateTime)
+    duration = sa.Column(sa.Integer)
+    answers = sa.Column(sa.JSON, default={})
+    score = sa.Column(sa.Float, default=0.0)
+    percentage = sa.Column(sa.Float, default=0.0)
+    passed = sa.Column(sa.Boolean, default=False)
+    user = relationship("User")
+    test = relationship("Test")
+    __table_args__ = (sa.UniqueConstraint("user_id", "test_id", name="uix_user_test"),)
 
-class Result(Base):
-    __tablename__ = 'results'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey('users.id'))
-    test_id: Mapped[int] = mapped_column(ForeignKey('tests.id'))
-    score: Mapped[int] = mapped_column(Integer)
-    total_questions: Mapped[int] = mapped_column(Integer)
-    percentage: Mapped[float] = mapped_column(Float)
-    wrong_answers_json: Mapped[str] = mapped_column(Text) # JSON string
-    time_taken_seconds: Mapped[int] = mapped_column(Integer, default=0)
-    completed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+class MessageLog(Base):
+    __tablename__ = "messages"
+    id = sa.Column(sa.Integer, primary_key=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey("users.id", ondelete="SET NULL"))
+    text = sa.Column(sa.Text)
+    created_at = sa.Column(sa.DateTime, default=datetime.utcnow)
+    meta = sa.Column(sa.JSON, default={})
 
-    user = relationship("User", back_populates="results")
-    test = relationship("Test", back_populates="results")
-
-class AnalyticsLog(Base):
-    __tablename__ = 'analytics_logs'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
-    action: Mapped[str] = mapped_column(String)
-    metadata_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-# Engine & Session Maker
-engine = create_async_engine(config.db_url, echo=False)
-AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
+# DB helpers
 async def init_db():
     async with engine.begin() as conn:
-        # Tizim ishga tushganda jadvallarni yaratadi
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database schemas initialized successfully.")
 
-# =============================================================================
-# 4. STRUCTURED CALLBACK DATA (AIOGRAM 3)
-# =============================================================================
-class TestActionCB(CallbackData, prefix="test"):
-    action: str # start, fav, view
-    test_code: str
+async def get_session():
+    async with AsyncSessionLocal() as session:
+        yield session
 
-class PaginationCB(CallbackData, prefix="page"):
-    target: str # tests, leaderboard
-    page: int
+# ====== TELEGRAM BOT (aiogram v3) ======
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.storage.memory import MemoryStorage
 
-class AICB(CallbackData, prefix="ai"):
-    action: str # text, image, exit
+# Bot init
+bot = Bot(token=settings.BOT_TOKEN, parse_mode="HTML")
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
-# =============================================================================
-# 5. MIDDLEWARES (XAVFSIZLIK VA BAZA BILAN ISHLASH)
-# =============================================================================
-class DBSessionMiddleware(BaseMiddleware):
-    """Har bir so'rov uchun alohida xavfsiz DB sessiyasi ochadi"""
-    async def __call__(self, handler, event: Update, data: Dict[str, Any]) -> Any:
-        async with AsyncSessionLocal() as session:
-            data['db_session'] = session
-            return await handler(event, data)
-
-class ThrottlingMiddleware(BaseMiddleware):
-    """Anti-Spam (Rate Limiting) tizimi"""
-    def __init__(self, limit: float = 0.5):
-        self.limit = limit
-        self.users_cache = {}
-
-    async def __call__(self, handler, event: Update, data: Dict[str, Any]) -> Any:
-        user_id = None
-        if event.message:
-            user_id = event.message.from_user.id
-        elif event.callback_query:
-            user_id = event.callback_query.from_user.id
-            
-        if user_id:
-            now = datetime.now()
-            last_time = self.users_cache.get(user_id)
-            if last_time and (now - last_time).total_seconds() < self.limit:
-                # Spam aniqlandi, so'rovni o'tkazmaymiz
-                if event.message:
-                    try:
-                        await event.message.delete() # xabarni o'chirish
-                    except:
-                        pass
-                return
-            self.users_cache[user_id] = now
-            
-        return await handler(event, data)
-
-class UserActivityMiddleware(BaseMiddleware):
-    """Foydalanuvchi oxirgi faolligini yangilab borish"""
-    async def __call__(self, handler, event: Update, data: Dict[str, Any]) -> Any:
-        session: AsyncSession = data.get('db_session')
-        user = None
-        if event.message:
-            user = event.message.from_user
-        elif event.callback_query:
-            user = event.callback_query.from_user
-            
-        if user and session:
-            stmt = select(User).where(User.id == user.id)
-            result = await session.execute(stmt)
-            db_user = result.scalar_one_or_none()
-            
-            if not db_user:
-                db_user = User(
-                    id=user.id,
-                    username=user.username,
-                    full_name=user.full_name
-                )
-                session.add(db_user)
-            else:
-                db_user.last_active = datetime.utcnow()
-                if user.username:
-                    db_user.username = user.username
-                db_user.full_name = user.full_name
-            await session.commit()
-            data['db_user'] = db_user
-            
-        return await handler(event, data)
-
-# =============================================================================
-# 6. FSM (STATE MANAGEMENT)
-# =============================================================================
-class UserFlow(StatesGroup):
-    waiting_for_test_code = State()
-    solving_test = State()
-    ai_tutor_mode = State()
-    contacting_admin = State()
-
-class AdminFlow(StatesGroup):
-    add_test_code = State()
-    add_test_title = State()
-    add_test_answers = State()
-    add_test_pdf = State()
-    broadcast_message = State()
-
-# =============================================================================
-# 7. SERVICES (BUSINESS LOGIC LAYER)
-# =============================================================================
-class GamificationEngine:
-    LEVEL_THRESHOLDS = [0, 1000, 2500, 5000, 10000, 20000, 50000, 100000]
-    
-    @staticmethod
-    def calculate_level(xp: int) -> int:
-        for i, threshold in enumerate(reversed(GamificationEngine.LEVEL_THRESHOLDS)):
-            if xp >= threshold:
-                return len(GamificationEngine.LEVEL_THRESHOLDS) - i
-        return 1
-
-    @staticmethod
-    def calculate_xp_reward(percentage: float, difficulty: str) -> int:
-        base = int(percentage * 10) # 100% = 1000 base XP
-        multiplier = {"Easy": 1.0, "Medium": 1.5, "Hard": 2.0, "Expert": 3.0}.get(difficulty, 1.0)
-        return int(base * multiplier)
-
-    @staticmethod
-    async def process_result(session: AsyncSession, user: User, percentage: float, difficulty: str) -> Tuple[int, int, bool]:
-        """XP beradi va Level Up bo'lganini tekshiradi. (XP, yangi_level, is_level_up) qaytaradi"""
-        gained_xp = GamificationEngine.calculate_xp_reward(percentage, difficulty)
-        old_level = user.level
-        
-        user.xp += gained_xp
-        new_level = GamificationEngine.calculate_level(user.xp)
-        user.level = new_level
-        
-        is_level_up = new_level > old_level
-        await session.commit()
-        return gained_xp, new_level, is_level_up
-
-class TestEngine:
-    @staticmethod
-    def evaluate(user_answers: str, correct_answers: str) -> dict:
-        u_ans = list(user_answers.upper())
-        c_ans = list(correct_answers.upper())
-        
-        total = len(c_ans)
-        score = 0
-        wrong_details = []
-        
-        for i in range(min(len(u_ans), total)):
-            if u_ans[i] == c_ans[i]:
-                score += 1
-            else:
-                wrong_details.append({
-                    "question": i + 1,
-                    "user": u_ans[i],
-                    "correct": c_ans[i]
-                })
-                
-        # O'tkazib yuborilgan savollar
-        for i in range(len(u_ans), total):
-            wrong_details.append({
-                "question": i + 1,
-                "user": "Yo'q",
-                "correct": c_ans[i]
-            })
-            
-        percentage = round((score / total) * 100, 2) if total > 0 else 0.0
-        return {
-            "score": score,
-            "total": total,
-            "percentage": percentage,
-            "wrong": wrong_details
-        }
-
-class AIIntegrationService:
-    """Multimodal AI ulanishi, Exponential Backoff (Fault tolerance) bilan"""
-    
-    @staticmethod
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    async def generate_explanation(question: str) -> str:
-        # Bu joyda API call bo'ladi (Gemini or OpenAI). 
-        # Hozir mock/fallback qilingan, chunki API kalitlar yo'q
-        await asyncio.sleep(1) # simulate network call
-        
-        return (
-            "🧠 <b>AI Tahlil (Mock):</b>\n\n"
-            f"Sizning so'rovingiz: <i>{question[:50]}...</i>\n\n"
-            "<b>Yechim qadamlari:</b>\n"
-            "1️⃣ Masala shartini to'g'ri tushunib oling.\n"
-            "2️⃣ Kerakli formulani qo'llang.\n"
-            "3️⃣ Qiymatlarni o'rniga qo'yib hisoblang.\n\n"
-            "<i>💡 (Izoh: Productionda bu yerga haqiqiy Gemini/GPT-4o ulangan bo'ladi va rasmlarni ham o'qiy oladi).</i>"
-        )
-
-# =============================================================================
-# 8. UI/UX: EXPERT LEVEL KEYBOARDS
-# =============================================================================
-def get_main_menu() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="📝 Testlar"))
-    builder.add(KeyboardButton(text="✅ Test Tekshirish"))
-    builder.add(KeyboardButton(text="🤖 AI Ustoz"))
-    builder.add(KeyboardButton(text="📊 Natijalarim"))
-    builder.add(KeyboardButton(text="🏆 Reyting (Top)"))
-    builder.add(KeyboardButton(text="👤 Profil"))
-    builder.adjust(2, 2, 2)
-    return builder.as_markup(resize_keyboard=True, input_field_placeholder="Tanlang...")
-
-def get_cancel_menu() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="❌ Bekor qilish"))
-    return builder.as_markup(resize_keyboard=True)
-
-def build_test_list_keyboard(tests: List[Test], page: int, total_pages: int) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for t in tests:
-        builder.button(text=f"{t.title} ({t.test_code}) - {t.difficulty}", 
-                       callback_data=TestActionCB(action="view", test_code=t.test_code))
-    
-    # Pagination
-    nav_buttons = []
-    if page > 1:
-        nav_buttons.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=PaginationCB(target="tests", page=page-1).pack()))
-    nav_buttons.append(InlineKeyboardButton(text=f"📄 {page}/{total_pages}", callback_data="ignore"))
-    if page < total_pages:
-        nav_buttons.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=PaginationCB(target="tests", page=page+1).pack()))
-    
-    if nav_buttons:
-        builder.row(*nav_buttons)
-    
-    builder.adjust(1) # Har bir test alohida qatorda, pagination esa eng pastda
-    return builder.as_markup()
-
-def get_ai_menu() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="✍️ Matnli savol", callback_data=AICB(action="text"))
-    builder.button(text="📸 Rasmli savol (Tez kunda)", callback_data=AICB(action="image"))
-    builder.button(text="🚪 AI Ustozdan chiqish", callback_data=AICB(action="exit"))
-    builder.adjust(2, 1)
-    return builder.as_markup()
-
-# =============================================================================
-# 9. HANDLERS (CONTROLLERS)
-# =============================================================================
-user_router = Router()
-admin_router = Router()
-
-# Admin filteri
-admin_router.message.filter(F.from_user.id == config.admin_id)
-
-@user_router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext, db_user: User):
-    await state.clear()
-    
-    welcome_text = (
-        f"Assalomu alaykum, <b>{message.from_user.full_name}</b>! 🎓\n\n"
-        f"Men <b>Premium Edu-Bot</b> man. Siz bu yerda:\n"
-        f"✔️ Testlaringizni tekshirishingiz\n"
-        f"✔️ AI Ustozdan yordam olishingiz\n"
-        f"✔️ XP yig'ib, darajangizni (Level) ko'tarishingiz mumkin.\n\n"
-        f"<i>Quyidagi menyudan kerakli bo'limni tanlang.</i>"
+# Keyboards
+def main_menu_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("📝 Testlar roʻyxati", callback_data="menu:tests"),
+        InlineKeyboardButton("🔍 Test tekshirish", callback_data="menu:check"),
     )
-    await message.answer(welcome_text, reply_markup=get_main_menu())
-
-@user_router.message(F.text == "❌ Bekor qilish")
-async def cancel_handler(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Barcha amallar bekor qilindi. Bosh menyudasiz.", reply_markup=get_main_menu())
-
-# --- PROFIL VA REYTING ---
-@user_router.message(F.text == "👤 Profil")
-async def show_profile(message: Message, db_user: User, db_session: AsyncSession):
-    # Qo'shimcha statistika
-    stmt = select(func.count(Result.id), func.avg(Result.percentage)).where(Result.user_id == db_user.id)
-    res = await db_session.execute(stmt)
-    total_tests, avg_perc = res.fetchone()
-    
-    total_tests = total_tests or 0
-    avg_perc = round(avg_perc or 0.0, 1)
-    
-    text = (
-        f"👨‍🎓 <b>Sizning Profilingiz</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🆔 ID: <code>{db_user.id}</code>\n"
-        f"🌟 Daraja (Level): <b>{db_user.level}</b>\n"
-        f"⚡️ XP: <b>{db_user.xp}</b>\n"
-        f"🔥 Streak (Ketma-ketlik): <b>{db_user.streak} kun</b>\n\n"
-        f"📊 <b>Statistika:</b>\n"
-        f"• Ishlangan testlar: {total_tests} ta\n"
-        f"• O'rtacha natija: {avg_perc}%\n"
-        f"━━━━━━━━━━━━━━━━━━"
+    kb.add(
+        InlineKeyboardButton("🤖 AI Ustoz", callback_data="menu:ai"),
+        InlineKeyboardButton("📊 Natijalarim", callback_data="menu:results"),
     )
-    await message.answer(text, reply_markup=get_main_menu())
-
-@user_router.message(F.text == "🏆 Reyting (Top)")
-async def show_leaderboard(message: Message, db_session: AsyncSession):
-    stmt = select(User).order_by(desc(User.xp)).limit(10)
-    result = await db_session.execute(stmt)
-    top_users = result.scalars().all()
-    
-    text = "🏆 <b>GLOBAL REYTING (TOP 10)</b>\n━━━━━━━━━━━━━━━━━━\n"
-    medals = ["🥇", "🥈", "🥉"]
-    for i, u in enumerate(top_users):
-        medal = medals[i] if i < 3 else "🎗"
-        name = u.full_name[:15] + ".." if len(u.full_name) > 15 else u.full_name
-        text += f"{medal} <b>{i+1}.</b> {name} — {u.level} Lvl ({u.xp} XP)\n"
-        
-    await message.answer(text)
-
-# --- TESTLAR RO'YXATI VA PAGINATION ---
-@user_router.message(F.text == "📝 Testlar")
-async def cmd_test_list(message: Message, db_session: AsyncSession):
-    await send_test_page(message.chat.id, db_session, message.bot, page=1)
-
-async def send_test_page(chat_id: int, session: AsyncSession, bot: Bot, page: int = 1, message_id: int = None):
-    PER_PAGE = 5
-    offset = (page - 1) * PER_PAGE
-    
-    # Total count
-    stmt_count = select(func.count(Test.id)).where(Test.is_active == True)
-    total_count = (await session.execute(stmt_count)).scalar() or 0
-    total_pages = (total_count + PER_PAGE - 1) // PER_PAGE or 1
-    
-    if page > total_pages: page = total_pages
-    
-    stmt = select(Test).where(Test.is_active == True).order_by(desc(Test.created_at)).limit(PER_PAGE).offset(offset)
-    tests = (await session.execute(stmt)).scalars().all()
-    
-    if not tests:
-        text = "📭 Hozircha tizimda faol testlar yo'q."
-        kb = None
-    else:
-        text = f"📚 <b>Barcha testlar ro'yxati</b> (Sahifa {page}/{total_pages}):\nTestni ko'rish uchun ustiga bosing."
-        kb = build_test_list_keyboard(tests, page, total_pages)
-        
-    if message_id:
-        await bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id, reply_markup=kb)
-    else:
-        await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
-
-@user_router.callback_query(PaginationCB.filter(F.target == "tests"))
-async def callback_pagination(query: CallbackQuery, callback_data: PaginationCB, db_session: AsyncSession):
-    await send_test_page(query.message.chat.id, db_session, query.bot, page=callback_data.page, message_id=query.message.message_id)
-    await query.answer()
-
-@user_router.callback_query(TestActionCB.filter(F.action == "view"))
-async def callback_view_test(query: CallbackQuery, callback_data: TestActionCB, db_session: AsyncSession):
-    test_code = callback_data.test_code
-    stmt = select(Test).where(Test.test_code == test_code)
-    test = (await db_session.execute(stmt)).scalar_one_or_none()
-    
-    if not test:
-        await query.answer("Bu test o'chirilgan yoki topilmadi.", show_alert=True)
-        return
-        
-    text = (
-        f"📘 <b>Test Ma'lumotlari:</b>\n\n"
-        f"🔖 Kod: <code>{test.test_code}</code>\n"
-        f"📝 Sarlavha: {test.title}\n"
-        f"📂 Kategoriya: {test.category}\n"
-        f"⚙️ Qiyinlik: {test.difficulty}\n"
-        f"🔢 Savollar soni: {len(test.correct_answers)}\n\n"
-        f"<i>Ushbu testni ishlash uchun '✅ Test Tekshirish' bo'limiga kirib kodni kiriting.</i>"
+    kb.add(
+        InlineKeyboardButton("🧾 Sertifikatlar", callback_data="menu:certs"),
+        InlineKeyboardButton("⚙️ Profilim", callback_data="menu:profile"),
     )
-    # Agar PDF bo'lsa, fayl yuborish mantiqi qo'shilishi mumkin
-    await query.message.answer(text)
-    await query.answer()
+    return kb
 
-# --- TEST TEKSHIRISH (CORE LOGIC) ---
-@user_router.message(F.text == "✅ Test Tekshirish")
-async def enter_test_code(message: Message, state: FSMContext):
-    await state.set_state(UserFlow.waiting_for_test_code)
-    await message.answer("🔍 Iltimos, tekshirmoqchi bo'lgan <b>test kodini</b> kiriting:", reply_markup=get_cancel_menu())
+def back_and_home_kb():
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("⬅️ Orqaga", callback_data="nav:back"))
+    kb.add(InlineKeyboardButton("🏠 Bosh menyu", callback_data="nav:home"))
+    return kb
 
-@user_router.message(UserFlow.waiting_for_test_code, F.text)
-async def process_test_code(message: Message, state: FSMContext, db_session: AsyncSession):
-    code = message.text.strip()
-    stmt = select(Test).where(Test.test_code == code, Test.is_active == True)
-    test = (await db_session.execute(stmt)).scalar_one_or_none()
-    
-    if not test:
-        await message.answer("❌ Bunday test kodi topilmadi. Qayta urinib ko'ring yoki /start bosing.")
-        return
-        
-    # Check if user already solved it
-    stmt_res = select(Result).where(Result.user_id == message.from_user.id, Result.test_id == test.id)
-    prev_res = (await db_session.execute(stmt_res)).scalar_one_or_none()
-    
-    if prev_res:
-        await message.answer(f"⚠️ Siz bu testni allaqachon ishlagansiz! Natijangiz: {prev_res.percentage}%", reply_markup=get_main_menu())
-        await state.clear()
-        return
+# Simple rate-limiter in memory (per-process)
+from collections import defaultdict
+_rate_counts = defaultdict(list)  # tg_id -> list of timestamps
 
-    await state.update_data(test_id=test.id, correct_answers=test.correct_answers, difficulty=test.difficulty)
-    await state.set_state(UserFlow.solving_test)
-    
-    await message.answer(
-        f"✅ <b>{test.title}</b> testi topildi.\n"
-        f"Savollar soni: {len(test.correct_answers)} ta.\n\n"
-        f"✏️ Endi javoblaringizni yuboring (Masalan: <code>abcdabcd</code> yoki <code>1a2b3c...</code>)",
-        reply_markup=get_cancel_menu()
+def is_rate_limited(tg_id: int) -> bool:
+    import time
+    window = 60
+    limit = settings.RATE_LIMIT_PER_MINUTE
+    now = time.time()
+    lst = _rate_counts[tg_id]
+    # drop old
+    _rate_counts[tg_id] = [t for t in lst if now - t < window]
+    if len(_rate_counts[tg_id]) >= limit:
+        return True
+    _rate_counts[tg_id].append(now)
+    return False
+
+# AI adapter (fallback)
+async def ai_explain_text(prompt: str) -> str:
+    # If real OpenAI/Gemini keys are configured, plug their client here.
+    # For now, return a simple Uzbek explanatory template.
+    await asyncio.sleep(0.2)  # simulate latency
+    return (
+        f"AI Ustoz:\nSiz so'radingiz: {prompt}\n\n"
+        "Qisqacha tushuntirish:\n1) Savol komponentlarini aniqlang.\n2) Asosiy formulani yozing.\n3) Bosqichma-bosqich yechimni bajaring.\n\n"
+        "Agar rasm yoki ovoz bo'lsa, iltimos /ai bilan matnni yuboring yoki rasmni ilova qiling."
     )
 
-@user_router.message(UserFlow.solving_test, F.text)
-async def check_answers(message: Message, state: FSMContext, db_user: User, db_session: AsyncSession):
-    data = await state.get_data()
-    correct_answers = data['correct_answers']
-    test_id = data['test_id']
-    difficulty = data['difficulty']
-    
-    user_ans = message.text.replace(" ", "").replace("\n", "").lower()
-    
-    # Simple validation
-    import re
-    if re.search(r'[^a-e]', user_ans):
-        await message.answer("⚠️ Javoblaringiz faqat A, B, C, D, E harflaridan iborat bo'lishi kerak. Qayta kiriting:")
-        return
-
-    if len(user_ans) != len(correct_answers):
-        await message.answer(f"⚠️ Javoblar soni mos emas! Testda {len(correct_answers)} ta savol bor, siz {len(user_ans)} ta kiritdingiz.")
-        return
-
-    # Baholash
-    evaluation = TestEngine.evaluate(user_ans, correct_answers)
-    
-    # DB ga saqlash
-    new_result = Result(
-        user_id=db_user.id,
-        test_id=test_id,
-        score=evaluation['score'],
-        total_questions=evaluation['total'],
-        percentage=evaluation['percentage'],
-        wrong_answers_json=json.dumps(evaluation['wrong'])
-    )
-    db_session.add(new_result)
-    
-    # Gamification Process
-    xp, new_level, is_level_up = await GamificationEngine.process_result(
-        db_session, db_user, evaluation['percentage'], difficulty
-    )
-    
-    # Natija matni shakllantirish
-    text = (
-        f"📋 <b>Test Yakunlandi!</b>\n\n"
-        f"🎯 To'g'ri javoblar: <b>{evaluation['score']} / {evaluation['total']}</b>\n"
-        f"📈 Foiz: <b>{evaluation['percentage']}%</b>\n"
-        f"🎁 Yutuq: <b>+{xp} XP</b>\n"
-    )
-    
-    if is_level_up:
-        text += f"\n🎉 <b>TABRIKLAYMIZ!</b> Siz yangi darajaga ko'tarildingiz: <b>Level {new_level}</b> 🚀\n"
-        
-    if evaluation['wrong']:
-        text += "\n❌ <b>Xatolaringiz:</b>\n"
-        for w in evaluation['wrong']:
-            text += f"{w['question']}-savol: Siz - {w['user'].upper()}, To'g'ri - {w['correct'].upper()}\n"
-        text += "\n<i>💡 Xatolaringizni tushunish uchun AI Ustozdan yordam so'rang!</i>"
-    else:
-        text += "\n🏆 <b>MUKAMMAL!</b> Barcha javoblar to'g'ri!"
-        
-    await message.answer(text, reply_markup=get_main_menu())
-    await state.clear()
-
-# --- AI USTOZ MODULI ---
-@user_router.message(F.text == "🤖 AI Ustoz")
-async def start_ai_mode(message: Message, state: FSMContext):
-    await state.set_state(UserFlow.ai_tutor_mode)
-    await message.answer(
-        "🧠 <b>AI Ustoz faollashdi.</b>\n\n"
-        "Tushunmagan misolingiz shartini yoki test savolini yozib yuboring. AI uni qadamma-qadam yechib tushuntiradi.",
-        reply_markup=get_cancel_menu()
-    )
-
-@user_router.message(UserFlow.ai_tutor_mode, F.text)
-async def process_ai_question(message: Message):
-    if message.text == "❌ Bekor qilish":
-        return # Handled by cancel_handler above
-        
-    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    status_msg = await message.answer("⏳ <i>AI savolingizni tahlil qilmoqda. Bu biroz vaqt olishi mumkin...</i>")
-    
+# Certificate generator
+def generate_certificate_bytes(name: str, test_title: str, percent: float) -> bytes:
+    # Try to use WeasyPrint if installed; otherwise return plain text bytes as fallback.
+    tpl = f"SERTIFIKAT\n\n{name} ga beriladi\nTest: {test_title}\nFoiz: {percent}%\nSana: {datetime.utcnow().date()}\n"
     try:
-        # AI integratsiyasini chaqirish (Retry logic bilan)
-        response = await AIIntegrationService.generate_explanation(message.text)
-        await status_msg.edit_text(response)
+        from jinja2 import Template
+        from weasyprint import HTML
+        html = Template("""
+        <html><body style="font-family: DejaVu Sans, sans-serif; text-align:center;">
+        <h1>SERTIFIKAT</h1>
+        <p><strong>{{ name }}</strong> ga beriladi</p>
+        <p>Test: {{ test_title }}</p>
+        <p>Foiz: {{ percent }}%</p>
+        <p>Sana: {{ date }}</p>
+        </body></html>
+        """).render(name=name, test_title=test_title, percent=percent, date=str(datetime.utcnow().date()))
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+        HTML(string=html).write_pdf(tmp.name)
+        tmp.seek(0)
+        data = tmp.read()
+        tmp.close()
+        os.unlink(tmp.name)
+        return data
     except Exception as e:
-        logger.error(f"AI Error: {e}")
-        await status_msg.edit_text("❌ Tizimda xatolik yuz berdi yoki AI serverlari band. Iltimos keyinroq urinib ko'ring.")
+        logger.debug("WeasyPrint not available or failed: %s", e)
+        return tpl.encode("utf-8")
 
-# --- ADMIN PANEL (ENTERPRISE GRADE) ---
-@admin_router.message(Command("admin"))
-async def admin_panel_start(message: Message):
-    builder = ReplyKeyboardBuilder()
-    builder.add(KeyboardButton(text="➕ Test Qo'shish"))
-    builder.add(KeyboardButton(text="📣 Xabar Tarqatish"))
-    builder.add(KeyboardButton(text="📊 Tizim Statistikasi"))
-    builder.add(KeyboardButton(text="🏠 Bosh menyu"))
-    builder.adjust(2, 1, 1)
-    await message.answer("👨‍💻 <b>Admin Panelga xush kelibsiz!</b>", reply_markup=builder.as_markup(resize_keyboard=True))
+# ====== HANDLERS ======
 
-@admin_router.message(F.text == "📊 Tizim Statistikasi")
-async def admin_stats(message: Message, db_session: AsyncSession):
-    users_count = (await db_session.execute(select(func.count(User.id)))).scalar()
-    tests_count = (await db_session.execute(select(func.count(Test.id)))).scalar()
-    results_count = (await db_session.execute(select(func.count(Result.id)))).scalar()
-    
-    text = (
-        "📊 <b>Enterprise Tizim Statistikasi</b>\n\n"
-        f"👥 Umumiy foydalanuvchilar: <b>{users_count}</b>\n"
-        f"📚 Jami bazadagi testlar: <b>{tests_count}</b>\n"
-        f"✅ Tekshirilgan testlar: <b>{results_count}</b>\n"
-        f"⚙️ Server holati: <b>STABLE (24/7)</b>\n"
-        f"🖥 Memory: <b>Optimallashtirilgan</b>"
-    )
-    await message.answer(text)
+# Startup: create DB
+@dp.startup()
+async def on_startup():
+    logger.info("Bot starting up...")
+    await init_db()
+    # If WEBHOOK_MODE true, you'd set webhook here (not implemented in single-file polling fallback)
+    if settings.WEBHOOK_MODE:
+        logger.info("WEBHOOK_MODE is enabled but full webhook wiring is not implemented in this single-file. Use polling or extend.")
 
-# =============================================================================
-# 10. GLOBAL EXCEPTION HANDLER
-# =============================================================================
-@user_router.errors()
-async def global_error_handler(event: ErrorEvent):
-    logger.critical(f"Kutilmagan xatolik ro'y berdi: {event.exception}")
-    if event.update.message:
-        await event.update.message.answer("⚠️ Tizimda vaqtinchalik nosozlik. Biz buni allaqachon to'g'rilayapmiz.")
-    elif event.update.callback_query:
-        await event.update.callback_query.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+# Global error handler
+@dp.errors()
+async def global_error_handler(update, exception):
+    logger.exception("Unhandled exception: %s", exception)
+    try:
+        if hasattr(update, "message") and update.message:
+            await update.message.answer("Kechirasiz, xatolik yuz berdi. Iltimos qayta urinib ko'ring yoki /help buyrug'idan foydalaning.")
+    except Exception:
+        logger.exception("Failed to notify user about the error")
     return True
 
-# =============================================================================
-# 11. WEB SERVER (RENDER/VPS UCHUN) & WEBHOOK/POLLING HYBRID
-# =============================================================================
-async def health_check(request):
-    """Render/Railway portini ushlab turish uchun HTTP 200 OK qaytaradi"""
-    return web.Response(text=json.dumps({"status": "ok", "architecture": "FAANG-level"}), content_type="application/json")
+# /start
+@dp.message(Command(commands=["start", "help"]))
+async def cmd_start(message: types.Message):
+    if is_rate_limited(message.from_user.id):
+        await message.reply("Siz juda tez-tez so'rov yuboryapsiz. Iltimos biroz kuting.")
+        return
+    # Upsert user into DB
+    async with AsyncSessionLocal() as session:
+        q = await session.execute(sa.select(User).where(User.tg_id == message.from_user.id))
+        user = q.scalars().first()
+        if not user:
+            user = User(
+                tg_id=message.from_user.id,
+                username=message.from_user.username,
+                first_name=message.from_user.first_name,
+                last_name=message.from_user.last_name,
+            )
+            session.add(user)
+            await session.commit()
+    text = (
+        "Assalomu alaykum! math_tekshiruvchi_bot ga xush kelibsiz.\n\n"
+        "🏠 Asosiy menyu uchun pastdagi tugmalardan birini tanlang."
+    )
+    await message.answer(text, reply_markup=main_menu_kb())
 
-async def webhook_handler(request):
-    """Telegramdan kelgan Webhook update'larni qabul qilish"""
-    bot: Bot = request.app['bot']
-    dp: Dispatcher = request.app['dp']
-    
-    data = await request.json()
-    update = Update.model_validate(data, context={"bot": bot})
-    await dp.feed_update(bot, update)
-    return web.Response(status=200)
+# Main menu callbacks
+@dp.callback_query(lambda c: c.data and c.data.startswith("menu:"))
+async def menu_callback(query: types.CallbackQuery):
+    if is_rate_limited(query.from_user.id):
+        await query.answer("Tizim band. Sekinroq urinib ko'ring.", show_alert=True)
+        return
+    data = query.data.split(":")[1]
+    if data == "tests":
+        await show_tests(query)
+    elif data == "ai":
+        await query.message.answer("AI Ustozga savolingizni yuboring. Matn uchun /ai buyruqidan foydalaning yoki ovoz/rasm yuboring.", reply_markup=back_and_home_kb())
+        await query.answer()
+    elif data == "check":
+        await query.message.answer("Test kodini kiriting:", reply_markup=back_and_home_kb())
+        await query.answer()
+    elif data == "profile":
+        await show_profile(query)
+    else:
+        await query.answer()
 
-async def setup_web_app(bot: Bot, dp: Dispatcher) -> web.Application:
-    app = web.Application()
-    app['bot'] = bot
-    app['dp'] = dp
-    
-    app.router.add_get('/', health_check)
-    app.router.add_get('/health', health_check)
-    if config.use_webhook and config.webhook_url:
-        app.router.add_post('/webhook', webhook_handler)
-        
-    return app
+# Show tests (paginated simple)
+async def show_tests(query: types.CallbackQuery, page: int = 1):
+    async with AsyncSessionLocal() as session:
+        stmt = sa.select(Test).order_by(Test.created_at.desc()).limit(8).offset((page-1)*8)
+        res = await session.execute(stmt)
+        items = res.scalars().all()
+        if not items:
+            await query.message.answer("Testlar topilmadi. Yaqinda qoʻshamiz!", reply_markup=back_and_home_kb())
+            await query.answer()
+            return
+        lines = []
+        for t in items:
+            lines.append(f"🧾 <b>{t.title}</b>\nKod: <code>{t.code}</code>\nKategoriya: {t.category} • {t.difficulty}")
+        text = "\n\n".join(lines)
+        await query.message.answer(text, reply_markup=back_and_home_kb())
+        await query.answer()
 
-# =============================================================================
-# 12. BACKGROUND TASKS (CRON JOBS)
-# =============================================================================
-async def reset_daily_streaks():
-    """Har kuni kechasi foydalanuvchilarning streaklarini yangilash/o'chirish"""
-    logger.info("CronJob ishladi: Streaklar tekshirilmoqda...")
-    # Bu yerda streakni 0 ga tushirish mantiqi yoziladi (oxirgi active sanasi > 24h bo'lsa)
-    pass
+# Show profile
+async def show_profile(query: types.CallbackQuery):
+    async with AsyncSessionLocal() as session:
+        q = await session.execute(sa.select(User).where(User.tg_id == query.from_user.id))
+        user = q.scalars().first()
+        if not user:
+            await query.message.answer("Profil topilmadi. /start buyrug'ini qayta bajaring.", reply_markup=back_and_home_kb())
+            await query.answer()
+            return
+        text = (
+            f"👤 Profil\n\nIsm: {user.first_name or ''} {user.last_name or ''}\n"
+            f"Foydalanuvchi: @{user.username or '—'}\nID: <code>{user.tg_id}</code>\n\n"
+            f"XP: {user.xp} • Level: {user.level} • Streak: {user.streak}\n"
+        )
+        await query.message.answer(text, reply_markup=back_and_home_kb())
+        await query.answer()
 
-def setup_scheduler():
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(reset_daily_streaks, 'cron', hour=0, minute=0)
-    scheduler.start()
-    return scheduler
-
-# =============================================================================
-# 13. MAIN APPLICATION RUNNER (GRACEFUL SHUTDOWN BILAN)
-# =============================================================================
-async def main():
-    logger.info("Tizim ishga tushirilmoqda... 🚀")
-    
-    # 1. DB Inicializatsiyasi
-    await init_db()
-    
-    # 2. Bot va Dispatcher
-    bot = Bot(token=config.bot_token.get_secret_value(), default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
-    
-    # 3. Middlewares
-    dp.update.outer_middleware(ThrottlingMiddleware(limit=config.rate_limit_seconds))
-    dp.update.outer_middleware(DBSessionMiddleware())
-    dp.update.outer_middleware(UserActivityMiddleware())
-    
-    # 4. Routers
-    dp.include_router(admin_router)
-    dp.include_router(user_router)
-    
-    # 5. Background Jobs
-    scheduler = setup_scheduler()
-    
-    # 6. Web Server (Render talabi)
-    app = await setup_web_app(bot, dp)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', config.port)
-    await site.start()
-    logger.info(f"Web server port: {config.port} da ishlamoqda. (Crash bo'lmaydi)")
-    
-    # 7. Start Bot
+# /ai text command
+@dp.message(Command(commands=["ai"]))
+async def cmd_ai(message: types.Message):
+    prompt = message.text or ""
+    prompt = prompt.removeprefix("/ai").strip()
+    if not prompt:
+        await message.reply("Iltimos, savolingizni yozing. Misol: /ai integrallarni tushuntiring")
+        return
+    await message.reply("AI ustoz javob tayyorlamoqda…")
     try:
-        await bot.set_my_commands([
-            BotCommand(command="start", description="Botni ishga tushirish"),
-            BotCommand(command="admin", description="Admin panel (faqat adminlar)")
-        ])
-        
-        if config.use_webhook and config.webhook_url:
-            webhook_url = f"{config.webhook_url}/webhook"
-            await bot.set_webhook(webhook_url, drop_pending_updates=True)
-            logger.info(f"Webhook sozlandi: {webhook_url}")
-            # Web server allaqachon webhook requestlarni qabul qilmoqda.
-            # Dastur to'xtamasligi uchun abadiy loop:
-            while True:
-                await asyncio.sleep(3600)
-        else:
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Bot Polling rejimida ish boshladi.")
-            await dp.start_polling(bot)
-            
+        resp = await ai_explain_text(prompt)
+        await message.reply(resp, reply_markup=back_and_home_kb())
     except Exception as e:
-        logger.critical(f"Application Crash: {e}")
+        logger.exception("AI explain failed: %s", e)
+        await message.reply("Kechirasiz, AI xizmatiga ulanish imkoni yo'q. Iltimos keyinroq urinib ko'ring.", reply_markup=back_and_home_kb())
+
+# Voice & photo handlers (stubs)
+@dp.message(lambda m: m.content_type in ("voice", "audio"))
+async def voice_handler(message: types.Message):
+    await message.reply("Ovoz qabul qilindi. Matnga aylantirish va tahlil qilinmoqda…")
+    # TODO: download file, convert, call speech-to-text, then ai_explain_text
+    await message.reply("Tahlil yakunlandi. (Bu stub)")
+
+@dp.message(lambda m: m.content_type in ("photo", "document"))
+async def photo_handler(message: types.Message):
+    await message.reply("Rasm qabul qilindi. Tahlil qilinmoqda…")
+    # TODO: OCR / handwriting recognition -> ai_explain_text
+    await message.reply("Tahlil yakunlandi. (Bu stub)")
+
+# Admin broadcast (admin only)
+@dp.message(Command(commands=["broadcast"]))
+async def cmd_broadcast(message: types.Message):
+    if str(message.from_user.id) != str(settings.ADMIN_ID):
+        await message.reply("Sizda bu buyruq uchun ruxsat yo'q.")
+        return
+    text = message.get_args()
+    if not text:
+        await message.reply("Iltimos, yuboriladigan xabar matnini kiriting: /broadcast Xabar matni")
+        return
+    await message.reply("Xabar qatorga qoʻyildi. Foydalanuvchilarga yuborish fon rejimida amalga oshiriladi.")
+    # For demo: broadcast to all users sequentially (small DB). In prod: push to queue.
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(sa.select(User.tg_id))
+        tg_ids = [r[0] for r in res.all()]
+    count = 0
+    for uid in tg_ids:
+        try:
+            await bot.send_message(uid, f"📢 Administrator xabari:\n\n{text}")
+            count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            logger.exception("Failed to send broadcast to %s", uid)
+    await message.reply(f"Xabar yuborildi: {count} foydalanuvchiga.")
+
+# Simple command to request certificate (demo)
+@dp.message(Command(commands=["certificate"]))
+async def cmd_certificate(message: types.Message):
+    # args: name|test|percent
+    args = message.get_args()
+    parts = [p.strip() for p in args.split("|")] if args else []
+    if len(parts) < 3:
+        await message.reply("Sertifikat generatsiyasi uchun format: /certificate Ism | Test nomi | Foiz\nMisol: /certificate Ali | Algebra 1 | 92")
+        return
+    name, test_title, percent = parts[0], parts[1], parts[2]
+    try:
+        percent_f = float(percent)
+    except:
+        percent_f = 0.0
+    await message.reply("Sertifikat yaratilmoqda…")
+    pdf_bytes = generate_certificate_bytes(name, test_title, percent_f)
+    try:
+        await bot.send_document(message.from_user.id, (f"certificate_{name}.pdf", pdf_bytes))
+    except Exception:
+        # fallback: send as text file
+        await bot.send_document(message.from_user.id, (f"certificate_{name}.txt", pdf_bytes))
+
+# Navigation callbacks
+@dp.callback_query(lambda c: c.data and c.data.startswith("nav:"))
+async def nav_callback(query: types.CallbackQuery):
+    cmd = query.data.split(":")[1]
+    if cmd == "back":
+        await query.message.answer("⬅️ Orqaga", reply_markup=main_menu_kb())
+    elif cmd == "home":
+        await query.message.answer("🏠 Bosh menyu", reply_markup=main_menu_kb())
+    await query.answer()
+
+# Catch-all text logs
+@dp.message()
+async def all_messages(message: types.Message):
+    # store message short log
+    try:
+        async with AsyncSessionLocal() as session:
+            mlog = MessageLog(user_id=message.from_user.id, text=(message.text or "")[:200])
+            session.add(mlog)
+            await session.commit()
+    except Exception:
+        logger.exception("Failed to log message")
+    # helpful hint
+    if not message.text or message.text.startswith("/"):
+        return
+    await message.answer("Men AI Ustoz va testlarni boshqaraman. /help yoki bosh menyudan tanlang.", reply_markup=main_menu_kb())
+
+# ====== FASTAPI APP (health + optional webhook receiver) ======
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+@app.on_event("startup")
+async def startup_event():
+    # ensure DB exists
+    await init_db()
+    logger.info("HTTP app startup complete")
+
+@app.get("/health")
+async def health():
+    return JSONResponse({"status": "ok", "app": "math_tekshiruvchi_bot"})
+
+@app.post(settings.WEBHOOK_PATH)
+async def webhook_receiver(request: Request):
+    # For production: integrate aiogram webhook processing here; this stub accepts updates
+    try:
+        data = await request.json()
+        logger.debug("Webhook update received: keys=%s", list(data.keys()))
+    except Exception as e:
+        logger.exception("Invalid webhook payload: %s", e)
+    return JSONResponse({"status": "received"})
+
+# ====== RUN LOGIC ======
+async def start_polling():
+    logger.info("Starting aiogram polling...")
+    try:
+        await dp.start_polling(bot)
     finally:
-        logger.info("Tizim xavfsiz o'chirilmoqda (Graceful Shutdown)...")
         await bot.session.close()
-        await engine.dispose()
-        scheduler.shutdown()
-        await runner.cleanup()
+
+def run():
+    # If running as main, choose mode: polling (default) or start only HTTP app (via uvicorn)
+    mode = os.environ.get("RUN_MODE", "polling")  # "polling" or "http"
+    if mode == "http":
+        # run only HTTP (for Render web service). Use: uvicorn app_combined:app --host 0.0.0.0 --port $PORT
+        logger.info("RUN_MODE=http — serve FastAPI (use uvicorn to run).")
+    else:
+        # run polling in current process
+        try:
+            asyncio.run(start_polling())
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Shutting down...")
 
 if __name__ == "__main__":
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    run()
