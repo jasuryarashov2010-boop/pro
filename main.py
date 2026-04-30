@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse, FileResponse
+from starlette.responses import Response
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -260,12 +261,15 @@ class StateStore(Base):
     payload: Mapped[dict] = mapped_column(JSON, default=dict)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(TZ))
 
+ENGINE_CONNECT_ARGS = {"ssl": True} if DATABASE_URL.startswith("postgresql+") else {}
+
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
     future=True,
     pool_pre_ping=True,
     pool_recycle=1800,
+    connect_args=ENGINE_CONNECT_ARGS,
 )
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
@@ -494,164 +498,133 @@ def parse_int_or_none(v: str) -> Optional[int]:
         return None
 
 # ----------------------------- DB Helpers -----------------------------
+TEST_TABLE_NAME = "tests"
+TEST_REQUIRED_COLUMNS = [
+    "id",
+    "code",
+    "title",
+    "category",
+    "topic",
+    "difficulty",
+    "description",
+    "pdf_url",
+    "answer_key",
+    "total_questions",
+    "pass_percent",
+    "active",
+    "created_at",
+]
+
 async def _table_exists(conn, table_name: str) -> bool:
-    q = await conn.execute(
-        text("""
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = current_schema()
-              AND table_name = :table_name
-            LIMIT 1
-        """),
+    res = await conn.execute(
+        text(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name = :table_name
+            )
+            """
+        ),
         {"table_name": table_name},
     )
-    return q.first() is not None
+    return bool(res.scalar_one())
 
-
-async def _get_table_columns(conn, table_name: str) -> list[str]:
-    q = await conn.execute(
-        text("""
+async def _table_columns(conn, table_name: str) -> set[str]:
+    res = await conn.execute(
+        text(
+            """
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema = current_schema()
               AND table_name = :table_name
             ORDER BY ordinal_position
-        """),
+            """
+        ),
         {"table_name": table_name},
     )
-    return [row[0] for row in q.fetchall()]
+    return {row[0] for row in res.all()}
 
-async def _get_column_type(conn, table_name: str, column_name: str) -> str:
-    q = await conn.execute(
-        text("""
-            SELECT data_type
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = :table_name
-              AND column_name = :column_name
-            LIMIT 1
-        """),
-        {"table_name": table_name, "column_name": column_name},
-    )
-    row = q.first()
-    return str(row[0]).lower() if row else ""
+async def _add_missing_columns(conn, table_name: str, existing: set[str]) -> None:
+    additions = {
+        "category": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS category VARCHAR(128) NOT NULL DEFAULT 'Umumiy'",
+        "topic": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS topic VARCHAR(128) NOT NULL DEFAULT 'Matematika'",
+        "difficulty": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS difficulty VARCHAR(32) NOT NULL DEFAULT 'Oson'",
+        "description": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT ''",
+        "pdf_url": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS pdf_url TEXT NOT NULL DEFAULT ''",
+        "answer_key": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS answer_key JSON NOT NULL DEFAULT '{}'::json",
+        "total_questions": f"ALTER TABLE tests ADD COLUMN IF NOT EXISTS total_questions INTEGER NOT NULL DEFAULT 0",
+        "pass_percent": f"ALTER TABLE tests ADD COLUMN IF NOT EXISTS pass_percent INTEGER NOT NULL DEFAULT {MIN_PASS_PERCENT}",
+        "active": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+        "created_at": "ALTER TABLE tests ADD COLUMN IF NOT EXISTS created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()",
+    }
+    for column_name, sql in additions.items():
+        if column_name not in existing:
+            await conn.execute(text(sql))
 
-async def _table_exists(conn, table_name: str) -> bool:
-    q = await conn.execute(
-        text("""
-            SELECT 1
-            FROM information_schema.tables
-            WHERE table_schema = current_schema()
-              AND table_name = :table_name
-            LIMIT 1
-        """),
-        {"table_name": table_name},
-    )
-    return q.first() is not None
+async def _rebuild_tests_table(conn) -> None:
+    legacy_name = "tests_legacy_migration"
+    await conn.execute(text(f"DROP TABLE IF EXISTS {legacy_name}"))
+    await conn.execute(text(f'ALTER TABLE {TEST_TABLE_NAME} RENAME TO {legacy_name}'))
+    await conn.run_sync(Base.metadata.create_all)
 
-async def _safe_add_column(conn, table_name: str, column_name: str, ddl: str) -> None:
-    columns = set(await _get_table_columns(conn, table_name))
-    if column_name not in columns:
-        await conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {ddl}'))
+    legacy_cols = await _table_columns(conn, legacy_name)
+    target_cols = await _table_columns(conn, TEST_TABLE_NAME)
+    copy_map: list[tuple[str, str]] = []
 
-async def _repair_tests_table(conn) -> None:
-    """Repair the tests table in place so old Render databases do not crash startup.
+    def _json_expr(col: str) -> str:
+        return f"""CASE
+            WHEN {col} IS NULL THEN '{{}}'::json
+            WHEN btrim({col}::text) = '' THEN '{{}}'::json
+            ELSE ({col})::json
+        END"""
 
-    This function avoids rename/copy migrations because Render startup can be
-    interrupted by legacy schema mismatches. Instead, it adds missing columns,
-    upgrades answer_key to JSON when needed, and backfills ids when absent.
-    """
-    if not await _table_exists(conn, "tests"):
-        await conn.run_sync(Base.metadata.create_all)
+    for col in TEST_REQUIRED_COLUMNS:
+        if col == "id":
+            continue
+        if col in legacy_cols and col in target_cols:
+            if col == "answer_key":
+                copy_map.append((col, _json_expr(col)))
+            else:
+                copy_map.append((col, col))
+
+    if not copy_map:
+        logger.warning("Legacy tests table had no transferable columns; keeping empty new table.")
+        await conn.execute(text(f"DROP TABLE IF EXISTS {legacy_name}"))
         return
 
-    # Add missing columns safely.
-    await _safe_add_column(conn, "tests", "id", "BIGSERIAL")
-    await _safe_add_column(conn, "tests", "code", "VARCHAR(64)")
-    await _safe_add_column(conn, "tests", "title", "VARCHAR(255)")
-    await _safe_add_column(conn, "tests", "category", "VARCHAR(128) DEFAULT 'Umumiy'")
-    await _safe_add_column(conn, "tests", "topic", "VARCHAR(128) DEFAULT 'Matematika'")
-    await _safe_add_column(conn, "tests", "difficulty", "VARCHAR(32) DEFAULT 'Oson'")
-    await _safe_add_column(conn, "tests", "description", "TEXT DEFAULT ''")
-    await _safe_add_column(conn, "tests", "pdf_url", "TEXT DEFAULT ''")
-    await _safe_add_column(conn, "tests", "answer_key", "JSON DEFAULT '{}'::json")
-    await _safe_add_column(conn, "tests", "total_questions", "INTEGER DEFAULT 0")
-    await _safe_add_column(conn, "tests", "pass_percent", "INTEGER DEFAULT 60")
-    await _safe_add_column(conn, "tests", "active", "BOOLEAN DEFAULT TRUE")
-    await _safe_add_column(conn, "tests", "created_at", "TIMESTAMP WITH TIME ZONE DEFAULT NOW()")
+    insert_cols = ", ".join(col for col, _ in copy_map)
+    select_cols = ", ".join(expr for _, expr in copy_map)
 
-    # Backfill id if it exists but is still NULL for legacy rows.
-    columns = set(await _get_table_columns(conn, "tests"))
-    if "id" in columns:
-        try:
-            await conn.execute(text("UPDATE tests SET id = nextval(pg_get_serial_sequence('tests', 'id')) WHERE id IS NULL"))
-        except Exception:
-            # If the sequence cannot be resolved, we still keep startup alive.
-            pass
+    await conn.execute(
+        text(
+            f"INSERT INTO {TEST_TABLE_NAME} ({insert_cols}) "
+            f"SELECT {select_cols} FROM {legacy_name}"
+        )
+    )
+    await conn.execute(text(f"DROP TABLE {legacy_name}"))
 
-        # Try to set PK only if the table does not already have one.
-        try:
-            q = await conn.execute(
-                text("""
-                    SELECT COUNT(*)
-                    FROM information_schema.table_constraints
-                    WHERE table_schema = current_schema()
-                      AND table_name = 'tests'
-                      AND constraint_type = 'PRIMARY KEY'
-                """)
-            )
-            has_pk = (q.scalar_one() or 0) > 0
-            if not has_pk:
-                await conn.execute(text("ALTER TABLE tests ADD PRIMARY KEY (id)"))
-        except Exception:
-            pass
+async def _repair_tests_schema(conn) -> None:
+    if not await _table_exists(conn, TEST_TABLE_NAME):
+        return
 
-    # Upgrade answer_key type when the old table stored it as text.
-    try:
-        current_type = await _get_column_type(conn, "tests", "answer_key")
-        if current_type in {"character varying", "text", "varchar", "jsonb"}:
-            if current_type in {"character varying", "text", "varchar"}:
-                await conn.execute(text(
-                    """
-                    ALTER TABLE tests
-                    ALTER COLUMN answer_key TYPE JSON
-                    USING CASE
-                        WHEN answer_key IS NULL OR answer_key = '' THEN '{}'::json
-                        ELSE answer_key::json
-                    END
-                    """
-                ))
-    except Exception:
-        # If the existing data is malformed, do not kill startup.
-        pass
+    existing = await _table_columns(conn, TEST_TABLE_NAME)
+    critical_missing = {"id", "code", "title", "answer_key"} & (set(TEST_REQUIRED_COLUMNS) - existing)
+    if critical_missing:
+        await _rebuild_tests_table(conn)
+        return
 
-    # Enforce sane defaults on frequently used columns.
-    for ddl in [
-        "ALTER TABLE tests ALTER COLUMN code SET DEFAULT ''",
-        "ALTER TABLE tests ALTER COLUMN title SET DEFAULT ''",
-        "ALTER TABLE tests ALTER COLUMN category SET DEFAULT 'Umumiy'",
-        "ALTER TABLE tests ALTER COLUMN topic SET DEFAULT 'Matematika'",
-        "ALTER TABLE tests ALTER COLUMN difficulty SET DEFAULT 'Oson'",
-        "ALTER TABLE tests ALTER COLUMN description SET DEFAULT ''",
-        "ALTER TABLE tests ALTER COLUMN pdf_url SET DEFAULT ''",
-        "ALTER TABLE tests ALTER COLUMN total_questions SET DEFAULT 0",
-        "ALTER TABLE tests ALTER COLUMN pass_percent SET DEFAULT 60",
-        "ALTER TABLE tests ALTER COLUMN active SET DEFAULT TRUE",
-        "ALTER TABLE tests ALTER COLUMN created_at SET DEFAULT NOW()",
-    ]:
-        try:
-            await conn.execute(text(ddl))
-        except Exception:
-            pass
+    await _add_missing_columns(conn, TEST_TABLE_NAME, existing)
 
 async def init_db():
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
         try:
-            await conn.run_sync(Base.metadata.create_all)
-            await _repair_tests_table(conn)
-            await conn.run_sync(Base.metadata.create_all)
+            await _repair_tests_schema(conn)
         except Exception as e:
-            logger.exception("DB init/migration failed but app will keep running: %s", e)
+            logger.exception("Legacy schema repair failed: %s", e)
+
 async def session_scope():
     async with SessionLocal() as session:
         yield session
