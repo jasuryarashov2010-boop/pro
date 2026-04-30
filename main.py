@@ -494,9 +494,77 @@ def parse_int_or_none(v: str) -> Optional[int]:
         return None
 
 # ----------------------------- DB Helpers -----------------------------
+async def _table_exists(conn, table_name: str) -> bool:
+    q = await conn.execute(
+        text("""
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+            LIMIT 1
+        """),
+        {"table_name": table_name},
+    )
+    return q.first() is not None
+
+async def _get_table_columns(conn, table_name: str) -> list[str]:
+    q = await conn.execute(
+        text("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+            ORDER BY ordinal_position
+        """),
+        {"table_name": table_name},
+    )
+    return [row[0] for row in q.fetchall()]
+
+async def _repair_tests_table(conn) -> None:
+    """Ensure the `tests` table has the current schema.
+
+    If an older database still has `tests` without `id`, we preserve the old
+    data by renaming it, creating the current table, and copying compatible
+    columns back.
+    """
+    if not await _table_exists(conn, "tests"):
+        await conn.run_sync(Base.metadata.create_all)
+        return
+
+    columns = set(await _get_table_columns(conn, "tests"))
+    if "id" in columns:
+        return
+
+    legacy_name = "tests_legacy_migration"
+    await conn.execute(text(f'DROP TABLE IF EXISTS "{legacy_name}"'))
+    await conn.execute(text('ALTER TABLE tests RENAME TO tests_legacy_migration'))
+    await conn.run_sync(Base.metadata.create_all)
+
+    legacy_cols = columns - {"id"}
+    preferred_order = [
+        "code", "title", "category", "topic", "difficulty", "description",
+        "pdf_url", "answer_key", "total_questions", "pass_percent",
+        "active", "created_at"
+    ]
+    copy_cols = [c for c in preferred_order if c in legacy_cols]
+    if not copy_cols:
+        await conn.execute(text('DROP TABLE IF EXISTS tests_legacy_migration'))
+        return
+
+    cols_sql = ", ".join(copy_cols)
+    await conn.execute(
+        text(f'INSERT INTO tests ({cols_sql}) SELECT {cols_sql} FROM tests_legacy_migration')
+    )
+    await conn.execute(text('DROP TABLE tests_legacy_migration'))
+
 async def init_db():
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        try:
+            await conn.run_sync(Base.metadata.create_all)
+            await _repair_tests_table(conn)
+            await conn.run_sync(Base.metadata.create_all)
+        except Exception as e:
+            logger.exception("DB init/migration failed but app will keep running: %s", e)
 
 async def session_scope():
     async with SessionLocal() as session:
@@ -608,9 +676,13 @@ DEMO_TESTS = [
 ]
 
 async def seed_tests(session: AsyncSession):
-    q = await session.execute(select(func.count(Test.id)))
-    count = q.scalar_one()
-    if count and count > 0:
+    # Existence check uses raw SQL so it never references a specific column shape.
+    try:
+        q = await session.execute(text("SELECT 1 FROM tests LIMIT 1"))
+        if q.first() is not None:
+            return
+    except Exception as e:
+        logger.warning("Seed check skipped due to tests table issue: %s", e)
         return
     for t in DEMO_TESTS:
         session.add(Test(**t, pass_percent=MIN_PASS_PERCENT, active=True))
@@ -1356,7 +1428,7 @@ async def handle_callback(session: AsyncSession, update: dict):
 async def show_admin_analytics(session: AsyncSession, chat_id: int):
     users = (await session.execute(select(func.count(User.id)))).scalar_one()
     results = (await session.execute(select(func.count(Result.id)))).scalar_one()
-    tests = (await session.execute(select(func.count(Test.id)))).scalar_one()
+    tests = (await session.execute(select(func.count()).select_from(Test))).scalar_one()
     top_test_q = await session.execute(select(Result.test_code, func.count(Result.id)).group_by(Result.test_code).order_by(desc(func.count(Result.id))).limit(5))
     top_tests = top_test_q.all()
     body = (
@@ -1477,11 +1549,23 @@ async def on_startup():
     logger.info("Starting %s", BOT_NAME)
     logger.info("DB: %s", DATABASE_URL)
     logger.info("BOT_TOKEN: %s", mask_secret(BOT_TOKEN))
-    await init_db()
-    async with SessionLocal() as session:
-        await seed_tests(session)
-        await ensure_sample_fallback(session)
-        await session.commit()
+    try:
+        await init_db()
+    except Exception as e:
+        logger.exception("Init DB failed, continuing in degraded mode: %s", e)
+
+    try:
+        async with SessionLocal() as session:
+            try:
+                await seed_tests(session)
+                await ensure_sample_fallback(session)
+                await session.commit()
+            except Exception as e:
+                logger.exception("Startup seeding skipped: %s", e)
+                await session.rollback()
+    except Exception as e:
+        logger.exception("Session bootstrap skipped: %s", e)
+
     if APP_ROLE == "polling" or not WEBHOOK_URL:
         polling_task = asyncio.create_task(polling_loop())
     else:
@@ -1520,7 +1604,7 @@ async def dashboard(secret: str):
         raise HTTPException(status_code=403, detail="Forbidden")
     async with SessionLocal() as session:
         users = (await session.execute(select(func.count(User.id)))).scalar_one()
-        tests = (await session.execute(select(func.count(Test.id)))).scalar_one()
+        tests = (await session.execute(select(func.count()).select_from(Test))).scalar_one()
         results = (await session.execute(select(func.count(Result.id)))).scalar_one()
         return {"users": users, "tests": tests, "results": results, "min_pass_percent": MIN_PASS_PERCENT}
 
