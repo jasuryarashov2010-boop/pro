@@ -9,3 +9,4 @@ openai
 google-generativeai
 reportlab
 python-multipart
+gunicorn
