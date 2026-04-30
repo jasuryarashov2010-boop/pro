@@ -507,6 +507,7 @@ async def _table_exists(conn, table_name: str) -> bool:
     )
     return q.first() is not None
 
+
 async def _get_table_columns(conn, table_name: str) -> list[str]:
     q = await conn.execute(
         text("""
@@ -520,42 +521,128 @@ async def _get_table_columns(conn, table_name: str) -> list[str]:
     )
     return [row[0] for row in q.fetchall()]
 
-async def _repair_tests_table(conn) -> None:
-    """Ensure the `tests` table has the current schema.
+async def _get_column_type(conn, table_name: str, column_name: str) -> str:
+    q = await conn.execute(
+        text("""
+            SELECT data_type
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+              AND column_name = :column_name
+            LIMIT 1
+        """),
+        {"table_name": table_name, "column_name": column_name},
+    )
+    row = q.first()
+    return str(row[0]).lower() if row else ""
 
-    If an older database still has `tests` without `id`, we preserve the old
-    data by renaming it, creating the current table, and copying compatible
-    columns back.
+async def _table_exists(conn, table_name: str) -> bool:
+    q = await conn.execute(
+        text("""
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = current_schema()
+              AND table_name = :table_name
+            LIMIT 1
+        """),
+        {"table_name": table_name},
+    )
+    return q.first() is not None
+
+async def _safe_add_column(conn, table_name: str, column_name: str, ddl: str) -> None:
+    columns = set(await _get_table_columns(conn, table_name))
+    if column_name not in columns:
+        await conn.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column_name}" {ddl}'))
+
+async def _repair_tests_table(conn) -> None:
+    """Repair the tests table in place so old Render databases do not crash startup.
+
+    This function avoids rename/copy migrations because Render startup can be
+    interrupted by legacy schema mismatches. Instead, it adds missing columns,
+    upgrades answer_key to JSON when needed, and backfills ids when absent.
     """
     if not await _table_exists(conn, "tests"):
         await conn.run_sync(Base.metadata.create_all)
         return
 
+    # Add missing columns safely.
+    await _safe_add_column(conn, "tests", "id", "BIGSERIAL")
+    await _safe_add_column(conn, "tests", "code", "VARCHAR(64)")
+    await _safe_add_column(conn, "tests", "title", "VARCHAR(255)")
+    await _safe_add_column(conn, "tests", "category", "VARCHAR(128) DEFAULT 'Umumiy'")
+    await _safe_add_column(conn, "tests", "topic", "VARCHAR(128) DEFAULT 'Matematika'")
+    await _safe_add_column(conn, "tests", "difficulty", "VARCHAR(32) DEFAULT 'Oson'")
+    await _safe_add_column(conn, "tests", "description", "TEXT DEFAULT ''")
+    await _safe_add_column(conn, "tests", "pdf_url", "TEXT DEFAULT ''")
+    await _safe_add_column(conn, "tests", "answer_key", "JSON DEFAULT '{}'::json")
+    await _safe_add_column(conn, "tests", "total_questions", "INTEGER DEFAULT 0")
+    await _safe_add_column(conn, "tests", "pass_percent", "INTEGER DEFAULT 60")
+    await _safe_add_column(conn, "tests", "active", "BOOLEAN DEFAULT TRUE")
+    await _safe_add_column(conn, "tests", "created_at", "TIMESTAMP WITH TIME ZONE DEFAULT NOW()")
+
+    # Backfill id if it exists but is still NULL for legacy rows.
     columns = set(await _get_table_columns(conn, "tests"))
     if "id" in columns:
-        return
+        try:
+            await conn.execute(text("UPDATE tests SET id = nextval(pg_get_serial_sequence('tests', 'id')) WHERE id IS NULL"))
+        except Exception:
+            # If the sequence cannot be resolved, we still keep startup alive.
+            pass
 
-    legacy_name = "tests_legacy_migration"
-    await conn.execute(text(f'DROP TABLE IF EXISTS "{legacy_name}"'))
-    await conn.execute(text('ALTER TABLE tests RENAME TO tests_legacy_migration'))
-    await conn.run_sync(Base.metadata.create_all)
+        # Try to set PK only if the table does not already have one.
+        try:
+            q = await conn.execute(
+                text("""
+                    SELECT COUNT(*)
+                    FROM information_schema.table_constraints
+                    WHERE table_schema = current_schema()
+                      AND table_name = 'tests'
+                      AND constraint_type = 'PRIMARY KEY'
+                """)
+            )
+            has_pk = (q.scalar_one() or 0) > 0
+            if not has_pk:
+                await conn.execute(text("ALTER TABLE tests ADD PRIMARY KEY (id)"))
+        except Exception:
+            pass
 
-    legacy_cols = columns - {"id"}
-    preferred_order = [
-        "code", "title", "category", "topic", "difficulty", "description",
-        "pdf_url", "answer_key", "total_questions", "pass_percent",
-        "active", "created_at"
-    ]
-    copy_cols = [c for c in preferred_order if c in legacy_cols]
-    if not copy_cols:
-        await conn.execute(text('DROP TABLE IF EXISTS tests_legacy_migration'))
-        return
+    # Upgrade answer_key type when the old table stored it as text.
+    try:
+        current_type = await _get_column_type(conn, "tests", "answer_key")
+        if current_type in {"character varying", "text", "varchar", "jsonb"}:
+            if current_type in {"character varying", "text", "varchar"}:
+                await conn.execute(text(
+                    """
+                    ALTER TABLE tests
+                    ALTER COLUMN answer_key TYPE JSON
+                    USING CASE
+                        WHEN answer_key IS NULL OR answer_key = '' THEN '{}'::json
+                        ELSE answer_key::json
+                    END
+                    """
+                ))
+    except Exception:
+        # If the existing data is malformed, do not kill startup.
+        pass
 
-    cols_sql = ", ".join(copy_cols)
-    await conn.execute(
-        text(f'INSERT INTO tests ({cols_sql}) SELECT {cols_sql} FROM tests_legacy_migration')
-    )
-    await conn.execute(text('DROP TABLE tests_legacy_migration'))
+    # Enforce sane defaults on frequently used columns.
+    for ddl in [
+        "ALTER TABLE tests ALTER COLUMN code SET DEFAULT ''",
+        "ALTER TABLE tests ALTER COLUMN title SET DEFAULT ''",
+        "ALTER TABLE tests ALTER COLUMN category SET DEFAULT 'Umumiy'",
+        "ALTER TABLE tests ALTER COLUMN topic SET DEFAULT 'Matematika'",
+        "ALTER TABLE tests ALTER COLUMN difficulty SET DEFAULT 'Oson'",
+        "ALTER TABLE tests ALTER COLUMN description SET DEFAULT ''",
+        "ALTER TABLE tests ALTER COLUMN pdf_url SET DEFAULT ''",
+        "ALTER TABLE tests ALTER COLUMN total_questions SET DEFAULT 0",
+        "ALTER TABLE tests ALTER COLUMN pass_percent SET DEFAULT 60",
+        "ALTER TABLE tests ALTER COLUMN active SET DEFAULT TRUE",
+        "ALTER TABLE tests ALTER COLUMN created_at SET DEFAULT NOW()",
+    ]:
+        try:
+            await conn.execute(text(ddl))
+        except Exception:
+            pass
 
 async def init_db():
     async with engine.begin() as conn:
@@ -565,7 +652,6 @@ async def init_db():
             await conn.run_sync(Base.metadata.create_all)
         except Exception as e:
             logger.exception("DB init/migration failed but app will keep running: %s", e)
-
 async def session_scope():
     async with SessionLocal() as session:
         yield session
@@ -684,9 +770,15 @@ async def seed_tests(session: AsyncSession):
     except Exception as e:
         logger.warning("Seed check skipped due to tests table issue: %s", e)
         return
+
     for t in DEMO_TESTS:
-        session.add(Test(**t, pass_percent=MIN_PASS_PERCENT, active=True))
-    await session.flush()
+        try:
+            session.add(Test(**t, pass_percent=MIN_PASS_PERCENT, active=True))
+            await session.flush()
+        except Exception as e:
+            await session.rollback()
+            logger.warning("Skipping demo seed row %s due to schema issue: %s", t.get("code"), e)
+            return
 
 # ----------------------------- Bot Content -----------------------------
 def welcome_text(user: Optional[User] = None) -> str:
@@ -1597,6 +1689,10 @@ async def health():
 @app.get("/")
 async def root():
     return HTMLResponse("<h3>math_tekshiruvchi_bot is running</h3>")
+
+@app.head("/")
+async def root_head():
+    return Response(status_code=200)
 
 @app.get(f"/dashboard/{{secret}}")
 async def dashboard(secret: str):
